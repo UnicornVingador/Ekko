@@ -1,0 +1,1532 @@
+"""
+=================================================================================
+SCRIPT DE TRATAMENTO DE DADOS - REQUERIMENTOS DIGITAIS
+=================================================================================
+Autor: Jonathan Barbosa
+Objetivo: Limpar, processar e analisar dados de requerimentos digitais
+
+FUNCIONALIDADES:
+- Corrige encoding (UTF-8)
+- Remove quebras de linha e tags HTML
+- Gera estatísticas detalhadas
+- Separa dados por categorias
+- Exporta para múltiplos formatos
+- 🆕 DISTRIBUIÇÃO AUTOMÁTICA PARA COLABORADORES
+
+REQUISITOS:
+- pandas
+- openpyxl (para Excel)
+=================================================================================
+"""
+
+import pandas as pd
+import re
+from datetime import datetime
+import os
+from io import StringIO
+from contextlib import redirect_stdout
+
+# =============================================================================
+# 🎛️ MINI PAINEL DE CONTROLE
+# =============================================================================
+
+# Planilha modelo: usada APENAS como base na distribuição (não é lida como fonte de dados)
+PASTA_PLANILHA_MODELO = r"C:\Users\paulo.vivano\OneDrive - Corporativo\Documentos\script tratamento de dados"
+PLANILHA_MODELO = os.path.join(PASTA_PLANILHA_MODELO, "Gestao_Requerimentos.xlsm")
+ABA_MODELO = "BASE"  # None = primeira aba
+LINHA_CABECALHO_MODELO = 1
+PRIMEIRA_LINHA_DADOS = 2
+
+PASTA_SAIDA_COLABORADORES = "distribuicao_colaboradores"
+
+# Base da distribuição (A escolhido)
+COLUNA_DISTRIBUICAO = "TIPO_REQUERIMENTO"
+
+# Coluna do template que registra o responsável
+COLUNA_RESPONSAVEL_MODELO = "COLABORADORES"
+
+# ✅ MUDANÇA IMPORTANTE: agora ignora requerimentos sem responsável
+# - "erro": para o processo e obriga você configurar (era isso que dava erro)
+# - "relatorio": gera nao_atribuidos.csv e segue sem esses itens
+REGRA_SEM_RESPONSAVEL = "relatorio"  # ← AGORA IGNORA OS QUE NÃO TEM RESPONSÁVEL
+
+# Quando mais de um colaborador puder receber o mesmo tipo:
+# - "equilibrado": distribui balanceado (menos carregado primeiro)
+# - "prioridade": usa a ordem do painel (primeiro da lista recebe)
+MODO_DISTRIBUICAO = "equilibrado"
+
+# Limite global (fallback). Pode sobrescrever por colaborador.
+LIMITE_PADRAO_POR_COLABORADOR = None
+
+# Gera CSV com resumo de distribuição
+GERAR_RELATORIO_RESUMO = True
+
+# ✅ CADA COLABORADOR SÓ RECEBE O QUE ESTIVER EM "recebe"
+# Os 15 tipos estão distribuídos entre os colaboradores abaixo
+COLABORADORES = {
+    "Jonathan": {
+        "ativo": True,
+        "recebe": [
+            "REVISÃO OU ACERTO DE NOTAS E FALTAS ONLINE",
+            "REVISAR NOTA DE AV/AVS - MATÉRIA ONLINE",
+            "SOLICITAR ACERTO DE NOTA/PRES. MATÉRIA PRESENCIAL",
+        ],
+        "limite": None
+    },
+    "Dani": {
+        "ativo": True,
+        "recebe": [
+            "MUDAR PARA OUTRO CURRÍCULO DO CURSO",
+            "RECLAMAÇÃO ATENDIMENTO DO COORD. DE CURSO",
+            "REVISÃO OU ACERTO DE NOTAS E FALTAS ONLINE",
+            "REVISAR NOTA DE AV/AVS - MATÉRIA ONLINE",
+        ],
+        "limite": None
+    },
+    "Tati": {
+        "ativo": True,
+        "recebe": [
+            "CURSAR MATÉRIA EM REGIME ESPECIAL - MESMO CAMPUS",
+            "CURSAR MATÉRIA EM REGIME ESPECIAL - OUTRO CAMPUS",
+        ],
+        "limite": None
+    },
+    "João": {
+        "ativo": True,
+        "recebe": [
+            "RECLAMAÇÃO DE PROCESSOS ACADÊMICOS",
+            "RECLAMAÇÃO DECLARAÇÕES ACADÊMICAS",
+        ],
+        "limite": None
+    },
+    "Kaio": {
+        "ativo": True,
+        "recebe": [
+            "DECLARAÇÃO DE CRITÉRIO DE APROVAÇÃO",
+            "MUDAR PARA OUTRO CURRÍCULO DO CURSO",
+        ],
+        "limite": None
+    },
+    "Raquel": {
+        "ativo": True,
+        "recebe": [
+            "REALIZAR SELEÇÃO PARA MONITORIA",
+            "RECLAMAÇÃO AGENDAMENTO/REAGENDAMENTO DE AVALIAÇÕES",
+        ],
+        "limite": None
+    },
+    "Lucas": {
+        "ativo": True,
+        "recebe": [
+            "RECLAMAÇÃO DE ESTÁGIO",
+            "SOLICITAR COLAÇÃO DE GRAU ANTECIPADA",
+        ],
+        "limite": None
+    },
+    "Carla": {
+        "ativo": False,
+        "recebe": [],
+        "limite": None
+    },
+}
+
+# =============================================================================
+# CLASSE PRINCIPAL - TRATADOR DE REQUERIMENTOS
+# =============================================================================
+
+class TratadorRequerimentos:
+    """
+    Classe responsável por processar e analisar requerimentos digitais.
+    """
+
+    def __init__(self, caminho_arquivo):
+        self.caminho_arquivo = caminho_arquivo
+        self.df = None
+        self.encoding = 'utf-8'
+        self.disciplinas_extraidas = None
+        self.diretorio_base = os.path.dirname(os.path.abspath(__file__))
+
+        print("=" * 80)
+        print("🚀 INICIANDO TRATAMENTO DE DADOS V2 (COM EXTRAÇÃO ROBUSTA DE DISCIPLINAS)")
+        print("=" * 80)
+
+    def _obter_caminho_saida(self, nome_pasta):
+        if os.path.isabs(nome_pasta):
+            return nome_pasta
+        return os.path.join(self.diretorio_base, nome_pasta)
+
+    # =========================================================================
+    # MÉTODO 1: CARREGAR DADOS
+    # =========================================================================
+
+    def carregar_dados(self):
+        extensao = os.path.splitext(self.caminho_arquivo)[1].lower()
+
+        if extensao in ['.xlsx', '.xls']:
+            try:
+                print(f"\n📁 Carregando arquivo Excel: {os.path.basename(self.caminho_arquivo)}")
+
+                if extensao == '.xlsx':
+                    self.df = pd.read_excel(self.caminho_arquivo, engine='openpyxl')
+                else:
+                    try:
+                        self.df = pd.read_excel(self.caminho_arquivo, engine='xlrd')
+                    except ImportError:
+                        self.df = pd.read_excel(self.caminho_arquivo, engine='openpyxl')
+
+                self.encoding = 'excel'
+                print(f"✅ Arquivo carregado com sucesso!")
+                print(f"📊 Total de registros: {len(self.df):,}")
+                print(f"📋 Total de colunas: {len(self.df.columns)}")
+                return True
+
+            except ImportError as e:
+                print(f"❌ Biblioteca necessária não instalada: {str(e)}")
+                print("   Para arquivos .xlsx, instale: pip install openpyxl")
+                print("   Para arquivos .xls, instale: pip install xlrd")
+                return False
+            except Exception as e:
+                print(f"❌ Erro ao carregar arquivo Excel: {str(e)}")
+                return False
+
+        elif extensao == '.csv':
+            encodings = ['utf-8', 'latin1', 'cp1252', 'iso-8859-1']
+
+            for enc in encodings:
+                try:
+                    print(f"\n📁 Tentando carregar CSV com encoding: {enc}")
+
+                    self.df = pd.read_csv(
+                        self.caminho_arquivo,
+                        encoding=enc,
+                        sep=',',
+                        quotechar='"',
+                        escapechar=None,
+                        low_memory=False,
+                        on_bad_lines='skip'
+                    )
+
+                    self.encoding = enc
+                    print(f"✅ Arquivo carregado com sucesso!")
+                    print(f"📊 Total de registros: {len(self.df):,}")
+                    print(f"📋 Total de colunas: {len(self.df.columns)}")
+                    return True
+
+                except UnicodeDecodeError:
+                    print(f"❌ Falhou com {enc}, tentando próximo...")
+                    continue
+                except Exception as e:
+                    print(f"⚠️  Erro ao carregar: {str(e)}")
+                    continue
+
+            print("\n❌ Não foi possível carregar o arquivo CSV com nenhum encoding testado.")
+            return False
+
+        else:
+            print(f"❌ Formato de arquivo não suportado: {extensao}")
+            print("   Formatos suportados: .csv, .xlsx, .xls")
+            return False
+
+    # =========================================================================
+    # MÉTODO 2: LIMPAR DADOS
+    # =========================================================================
+
+    def limpar_dados(self):
+        print("\n" + "=" * 80)
+        print("🧹 LIMPANDO DADOS")
+        print("=" * 80)
+
+        if self.df is None:
+            print("❌ Nenhum dado carregado. Execute carregar_dados() primeiro.")
+            return False
+
+        total_registros_inicial = len(self.df)
+
+        print("\n1️⃣  Removendo tags HTML...")
+        for coluna in self.df.columns:
+            if self.df[coluna].dtype == 'object':
+                self.df[coluna] = self.df[coluna].apply(
+                    lambda x: re.sub(r'<[^>]+>', '', str(x)) if pd.notna(x) else x
+                )
+
+        print("2️⃣  Removendo quebras de linha especiais...")
+        for coluna in self.df.columns:
+            if self.df[coluna].dtype == 'object':
+                self.df[coluna] = self.df[coluna].apply(
+                    lambda x: str(x).replace('_x000D_', ' ').replace('\r', ' ').replace('\n', ' ') if pd.notna(x) else x
+                )
+
+        print("3️⃣  Removendo espaços extras...")
+        for coluna in self.df.columns:
+            if self.df[coluna].dtype == 'object':
+                self.df[coluna] = self.df[coluna].apply(
+                    lambda x: ' '.join(str(x).split()) if pd.notna(x) else x
+                )
+
+        print("4️⃣  Removendo linhas vazias...")
+        self.df.dropna(how='all', inplace=True)
+
+        print("5️⃣  Convertendo colunas de data...")
+        colunas_data = ['DT_INICIO_ETAPA', 'DT_PRAZO_FINAL', 'DT_FIM_ESTIPULADO', 'INCLUSAO']
+        for coluna in colunas_data:
+            if coluna in self.df.columns:
+                try:
+                    self.df[coluna] = pd.to_datetime(self.df[coluna], errors='coerce')
+                except Exception:
+                    print(f"   ⚠️  Não foi possível converter coluna {coluna}")
+
+        registros_removidos = total_registros_inicial - len(self.df)
+        print(f"\n✅ Limpeza concluída!")
+        print(f"   📊 Registros removidos: {registros_removidos}")
+        print(f"   📊 Registros finais: {len(self.df):,}")
+
+        return True
+
+    # =========================================================================
+    # MÉTODO NOVO (FINAL): EXTRAIR DISCIPLINAS - ROBUSTO
+    # =========================================================================
+
+    def extrair_disciplinas(self, coluna_texto='TXT_FUNDAMENTACAO'):
+        """
+        Extrai disciplinas a partir de padrões reais da base.
+        """
+        print("\n" + "=" * 80)
+        print("📚 EXTRAINDO DISCIPLINAS (ROBUSTO: parênteses OU hífen, com sufixos)")
+        print("=" * 80)
+
+        if self.df is None:
+            print("❌ Nenhum dado carregado.")
+            return None
+
+        if coluna_texto not in self.df.columns:
+            print(f"❌ Coluna '{coluna_texto}' não encontrada.")
+            return None
+
+        padrao_parenteses = re.compile(
+            r'\bDisciplina:\s*'
+            r'(?P<nome>[^(\r\n]{3,160}?)\s*'
+            r'\(\s*(?P<codigo>[A-Z]{2,10}\d{2,10}(?:-\d{1,10})?)'
+            r'(?:\s*[-–—].*?)?\)'
+        )
+
+        padrao_hifen = re.compile(
+            r'\bDisciplina:\s*'
+            r'(?P<nome>[^\r\n]{3,160}?)\s*[-–—]\s*'
+            r'(?P<codigo>[A-Z]{2,10}\d{2,10}(?:-\d{1,10})?)\b'
+        )
+
+        registros = []
+
+        print(f"\n🔍 Analisando coluna: {coluna_texto}")
+        print(f"📊 Total de registros com texto: {int(self.df[coluna_texto].notna().sum()):,}")
+
+        for idx, texto in enumerate(self.df[coluna_texto]):
+            if pd.isna(texto):
+                continue
+
+            texto_str = str(texto)
+
+            matches = list(padrao_parenteses.finditer(texto_str)) + list(padrao_hifen.finditer(texto_str))
+            if not matches:
+                continue
+
+            for m in matches:
+                nome = ' '.join(m.group('nome').split()).strip()
+                codigo = str(m.group('codigo')).strip().upper()
+
+                if len(nome) < 3 or len(codigo) < 3:
+                    continue
+
+                bloqueios = ("MATRICULA", "CPF")
+                if any(b in nome.upper() for b in bloqueios):
+                    continue
+
+                disciplina_compacta = f"{nome} ({codigo})"
+
+                registros.append({
+                    'DISCIPLINA_NOME': nome,
+                    'DISCIPLINA_CODIGO': codigo,
+                    'DISCIPLINA': disciplina_compacta,
+                    'PROTOCOLO': self.df.loc[idx, 'PROTOCOLO'] if 'PROTOCOLO' in self.df.columns else None,
+                    'TIPO_REQUERIMENTO': self.df.loc[idx, 'TIPO_REQUERIMENTO'] if 'TIPO_REQUERIMENTO' in self.df.columns else None,
+                    'TEXTO_ORIGINAL': texto_str[:200]
+                })
+
+        if not registros:
+            print("\n⚠️  Nenhuma disciplina foi extraída.")
+            self.disciplinas_extraidas = pd.DataFrame(columns=[
+                'DISCIPLINA_NOME','DISCIPLINA_CODIGO','DISCIPLINA','PROTOCOLO','TIPO_REQUERIMENTO','TEXTO_ORIGINAL'
+            ])
+            return pd.DataFrame(columns=['DISCIPLINA', 'QUANTIDADE'])
+
+        self.disciplinas_extraidas = pd.DataFrame(registros)
+
+        df_ranking = (
+            self.disciplinas_extraidas
+            .groupby('DISCIPLINA', dropna=False)
+            .size()
+            .reset_index(name='QUANTIDADE')
+            .sort_values('QUANTIDADE', ascending=False)
+            .reset_index(drop=True)
+        )
+
+        protocolos_unicos = (
+            self.disciplinas_extraidas['PROTOCOLO'].dropna().nunique()
+            if 'PROTOCOLO' in self.disciplinas_extraidas.columns
+            else len(self.disciplinas_extraidas)
+        )
+
+        print(f"\n✅ Extração concluída!")
+        print(f"📊 Total de menções extraídas: {len(self.disciplinas_extraidas):,}")
+        print(f"📊 Total de disciplinas únicas: {len(df_ranking):,}")
+        print(f"📊 Protocolos com disciplina mencionada: {protocolos_unicos:,}")
+
+        return df_ranking
+
+    # =========================================================================
+    # MÉTODO 3: GERAR ESTATÍSTICAS
+    # =========================================================================
+
+    def gerar_estatisticas(self, incluir_disciplinas=True):
+        print("\n" + "=" * 80)
+        print("📈 GERANDO ESTATÍSTICAS")
+        print("=" * 80)
+
+        if self.df is None:
+            print("❌ Nenhum dado carregado.")
+            return None
+
+        estatisticas = {}
+
+        print("\n📊 ESTATÍSTICAS GERAIS")
+        print("-" * 40)
+        estatisticas['total_requerimentos'] = len(self.df)
+        print(f"Total de Requerimentos: {estatisticas['total_requerimentos']:,}")
+
+        print("\n📋 POR STATUS DE REQUERIMENTO")
+        print("-" * 40)
+        if 'STATUS_REQUERIMENTO' in self.df.columns:
+            status_counts = self.df['STATUS_REQUERIMENTO'].value_counts()
+            estatisticas['por_status'] = status_counts.to_dict()
+            for status, qtd in status_counts.items():
+                print(f"  {status}: {qtd:,} ({qtd/len(self.df)*100:.1f}%)")
+
+        print("\n📝 POR TIPO DE REQUERIMENTO (TOP 10)")
+        print("-" * 40)
+        if 'TIPO_REQUERIMENTO' in self.df.columns:
+            tipo_counts = self.df['TIPO_REQUERIMENTO'].value_counts().head(10)
+            estatisticas['por_tipo'] = tipo_counts.to_dict()
+            for tipo, qtd in tipo_counts.items():
+                tipo_str = str(tipo)[:50] if tipo is not None else "N/A"
+                print(f"  {tipo_str}: {qtd:,}")
+
+        print("\n🏫 POR CAMPUS (TOP 10)")
+        print("-" * 40)
+        if 'NOM_CAMPUS' in self.df.columns:
+            campus_counts = self.df['NOM_CAMPUS'].value_counts().head(10)
+            estatisticas['por_campus'] = campus_counts.to_dict()
+            for campus, qtd in campus_counts.items():
+                campus_str = str(campus)[:40] if campus is not None else "N/A"
+                print(f"  {campus_str}: {qtd:,}")
+
+        print("\n📚 POR TIPO DE CURSO")
+        print("-" * 40)
+        if 'NOM_TIPO_CURSO' in self.df.columns:
+            curso_counts = self.df['NOM_TIPO_CURSO'].value_counts()
+            estatisticas['por_tipo_curso'] = curso_counts.to_dict()
+            for curso, qtd in curso_counts.items():
+                print(f"  {curso}: {qtd:,}")
+
+        print("\n⏱️  POR FAIXA DE DIAS TOTAL")
+        print("-" * 40)
+        if 'FAIXA_DIAS_TOTAL' in self.df.columns:
+            dias_counts = self.df['FAIXA_DIAS_TOTAL'].value_counts()
+            estatisticas['por_faixa_dias'] = dias_counts.to_dict()
+            for faixa, qtd in dias_counts.items():
+                print(f"  {faixa}: {qtd:,}")
+
+        print("\n🤝 INDICADOR DE PARCEIRO")
+        print("-" * 40)
+        if 'IND_PARCEIRO' in self.df.columns:
+            parceiro_counts = self.df['IND_PARCEIRO'].value_counts()
+            estatisticas['parceiro'] = parceiro_counts.to_dict()
+            for ind, qtd in parceiro_counts.items():
+                parceiro_text = "Polo Parceiro" if ind == 'S' else "Polo Próprio"
+                print(f"  {parceiro_text}: {qtd:,}")
+
+        if incluir_disciplinas:
+            print("\n📚 TOP 10 DISCIPLINAS MAIS MENCIONADAS")
+            print("-" * 40)
+
+            if self.disciplinas_extraidas is None:
+                _ = self.extrair_disciplinas(coluna_texto='TXT_FUNDAMENTACAO')
+
+            if self.disciplinas_extraidas is not None and not self.disciplinas_extraidas.empty:
+                df_top = (
+                    self.disciplinas_extraidas
+                    .groupby(['DISCIPLINA_NOME', 'DISCIPLINA_CODIGO'], dropna=False)
+                    .size()
+                    .reset_index(name='QUANTIDADE')
+                    .sort_values('QUANTIDADE', ascending=False)
+                    .head(10)
+                    .reset_index(drop=True)
+                )
+
+                for _, row in df_top.iterrows():
+                    nome = str(row['DISCIPLINA_NOME']).strip()
+                    codigo = str(row['DISCIPLINA_CODIGO']).strip()
+                    qtd = int(row['QUANTIDADE'])
+                    print(f"  {nome} ({codigo}): {qtd:,} menções")
+
+                estatisticas['top_disciplinas'] = [
+                    {
+                        'DISCIPLINA_NOME': str(row['DISCIPLINA_NOME']).strip(),
+                        'DISCIPLINA_CODIGO': str(row['DISCIPLINA_CODIGO']).strip(),
+                        'QUANTIDADE': int(row['QUANTIDADE'])
+                    }
+                    for _, row in df_top.iterrows()
+                ]
+            else:
+                print("  ⚠️  Nenhuma disciplina foi extraída")
+                estatisticas['top_disciplinas'] = []
+
+        return estatisticas
+
+    # =========================================================================
+    # MÉTODO 4: SEPARAR POR CATEGORIA
+    # =========================================================================
+
+    def separar_por_categoria(self, coluna, pasta_saida='dados_separados'):
+        print("\n" + "=" * 80)
+        print(f"📂 SEPARANDO DADOS POR: {coluna}")
+        print("=" * 80)
+
+        if self.df is None:
+            print("❌ Nenhum dado carregado.")
+            return None
+
+        if coluna not in self.df.columns:
+            print(f"❌ Coluna '{coluna}' não encontrada no dataset.")
+            return None
+
+        pasta_saida_completa = self._obter_caminho_saida(pasta_saida)
+        os.makedirs(pasta_saida_completa, exist_ok=True)
+
+        arquivos_criados = {}
+        valores_unicos = self.df[coluna].dropna().unique()
+
+        print(f"\n📊 Encontrados {len(valores_unicos)} valores únicos")
+        print(f"📁 Salvando em: {pasta_saida_completa}\n")
+
+        for valor in valores_unicos:
+            df_filtrado = self.df[self.df[coluna] == valor]
+
+            nome_arquivo = re.sub(r'[^\w\s-]', '', str(valor))
+            nome_arquivo = re.sub(r'[-\s]+', '_', nome_arquivo)
+            nome_arquivo = nome_arquivo[:50]
+
+            caminho_arquivo = os.path.join(pasta_saida_completa, f"{nome_arquivo}.csv")
+
+            df_filtrado.to_csv(caminho_arquivo, index=False, encoding='utf-8-sig')
+            arquivos_criados[valor] = caminho_arquivo
+
+            print(f"  ✅ {valor}: {len(df_filtrado):,} registros → {nome_arquivo}.csv")
+
+        print(f"\n✅ Total de arquivos criados: {len(arquivos_criados)}")
+
+        return arquivos_criados
+
+    # =========================================================================
+    # MÉTODO 5: EXPORTAR DADOS
+    # =========================================================================
+
+    def exportar_dados(self, pasta_saida='dados_processados', exportar_disciplinas=True):
+        print("\n" + "=" * 80)
+        print("💾 EXPORTANDO DADOS PROCESSADOS")
+        print("=" * 80)
+
+        if self.df is None:
+            print("❌ Nenhum dado carregado.")
+            return None
+
+        pasta_saida_completa = self._obter_caminho_saida(pasta_saida)
+        os.makedirs(pasta_saida_completa, exist_ok=True)
+
+        tipos_interesse = [
+            "CURSAR MATÉRIA EM REGIME ESPECIAL - MESMO CAMPUS",
+            "RECLAMAÇÃO SOBRE MEU CURSO",
+            "RECLAMAÇÃO ATENDIMENTO DO COORD. DE CURSO",
+            "REVISÃO OU ACERTO DE NOTAS E FALTAS ONLINE",
+            "RECLAMAÇÃO DE PROCESSOS ACADÊMICOS",
+            "RECLAMAÇÃO DECLARAÇÕES ACADÊMICAS",
+            "CURSAR MATÉRIA EM REGIME ESPECIAL - OUTRO CAMPUS",
+            "DECLARAÇÃO DE CRITÉRIO DE APROVAÇÃO",
+            "MUDAR PARA OUTRO CURRÍCULO DO CURSO",
+            "REALIZAR SELEÇÃO PARA MONITORIA",
+            "RECLAMAÇÃO AGENDAMENTO/REAGENDAMENTO DE AVALIAÇÕES",
+            "RECLAMAÇÃO DE ESTÁGIO",
+            "REVISAR NOTA DE AV/AVS - MATÉRIA ONLINE",
+            "SOLICITAR ACERTO DE NOTA/PRES. MATÉRIA PRESENCIAL",
+            "SOLICITAR COLAÇÃO DE GRAU ANTECIPADA",
+        ]
+
+        df_original = self.df.copy()
+        df_filtrado = self.df.copy()
+        coluna_tipo = "TIPO_REQUERIMENTO"
+
+        if coluna_tipo in self.df.columns:
+            registros_antes = len(df_filtrado)
+
+            df_tipos_normalizados = self.df[coluna_tipo].fillna('').astype(str).str.strip().str.upper()
+            tipos_interesse_normalizados = [tipo.strip().upper() for tipo in tipos_interesse]
+
+            mascara = (df_tipos_normalizados != '') & (df_tipos_normalizados != 'NAN') & df_tipos_normalizados.isin(tipos_interesse_normalizados)
+            df_filtrado = self.df[mascara].copy()
+
+            registros_depois = len(df_filtrado)
+
+            tipos_na_base = self.df[coluna_tipo].dropna().unique()
+            tipos_encontrados = [tipo for tipo in tipos_na_base if str(tipo).strip().upper() in tipos_interesse_normalizados]
+
+            print(f"\n🔍 Filtrando por tipos de interesse...")
+            print(f"   📊 Registros antes do filtro: {registros_antes:,}")
+            print(f"   📊 Registros após filtro: {registros_depois:,}")
+            print(f"   📊 Tipos de interesse configurados: {len(tipos_interesse)} tipos")
+            print(f"   📊 Tipos encontrados na base: {len(tipos_encontrados)} tipos")
+        else:
+            print(f"\n⚠️  Coluna '{coluna_tipo}' não encontrada. Exportando todos os dados sem filtro.")
+
+        arquivos_exportados = {}
+
+        print("\n1️⃣  Exportando CSV completo...")
+        csv_completo_path = os.path.join(pasta_saida_completa, "requerimentos_completo.csv")
+        df_original.to_csv(csv_completo_path, index=False, encoding='utf-8-sig')
+        arquivos_exportados['csv_completo'] = csv_completo_path
+        print(f"   ✅ Salvo em: {csv_completo_path} ({len(df_original):,} registros)")
+
+        print("\n2️⃣  Exportando Excel completo...")
+        try:
+            excel_completo_path = os.path.join(pasta_saida_completa, "requerimentos_completo.xlsx")
+            df_original.to_excel(excel_completo_path, index=False, engine='openpyxl')
+            arquivos_exportados['excel_completo'] = excel_completo_path
+            print(f"   ✅ Salvo em: {excel_completo_path} ({len(df_original):,} registros)")
+        except Exception as e:
+            print(f"   ⚠️  Erro ao exportar Excel completo: {str(e)}")
+
+        print("\n3️⃣  Exportando CSV filtrado...")
+        csv_filtrado_path = os.path.join(pasta_saida_completa, "requerimentos_limpo.csv")
+        df_filtrado.to_csv(csv_filtrado_path, index=False, encoding='utf-8-sig')
+        arquivos_exportados['csv_filtrado'] = csv_filtrado_path
+        print(f"   ✅ Salvo em: {csv_filtrado_path} ({len(df_filtrado):,} registros)")
+
+        print("\n4️⃣  Exportando Excel filtrado...")
+        try:
+            excel_filtrado_path = os.path.join(pasta_saida_completa, "requerimentos_limpo.xlsx")
+            df_filtrado.to_excel(excel_filtrado_path, index=False, engine='openpyxl')
+            arquivos_exportados['excel_filtrado'] = excel_filtrado_path
+            print(f"   ✅ Salvo em: {excel_filtrado_path} ({len(df_filtrado):,} registros)")
+        except Exception as e:
+            print(f"   ⚠️  Erro ao exportar Excel filtrado: {str(e)}")
+
+        print("\n5️⃣  Exportando JSON...")
+        json_path = os.path.join(pasta_saida_completa, "requerimentos_limpo.json")
+        df_filtrado.to_json(json_path, orient='records', date_format='iso', force_ascii=False, indent=2)
+        arquivos_exportados['json'] = json_path
+        print(f"   ✅ Salvo em: {json_path}")
+
+        if exportar_disciplinas:
+            print("\n6️⃣  Exportando análise de disciplinas...")
+
+            if self.disciplinas_extraidas is None:
+                df_disciplinas_ranking = self.extrair_disciplinas()
+            else:
+                df_disciplinas_ranking = (
+                    self.disciplinas_extraidas
+                    .groupby('DISCIPLINA', dropna=False)
+                    .size()
+                    .reset_index(name='QUANTIDADE')
+                    .sort_values('QUANTIDADE', ascending=False)
+                    .reset_index(drop=True)
+                )
+
+            if df_disciplinas_ranking is not None and not df_disciplinas_ranking.empty:
+                disciplinas_csv_path = os.path.join(pasta_saida_completa, "disciplinas_ranking.csv")
+                df_disciplinas_ranking.to_csv(disciplinas_csv_path, index=False, encoding='utf-8-sig')
+                arquivos_exportados['disciplinas_ranking_csv'] = disciplinas_csv_path
+                print(f"   ✅ Ranking salvo em: {disciplinas_csv_path}")
+
+                try:
+                    disciplinas_excel_path = os.path.join(pasta_saida_completa, "disciplinas_ranking.xlsx")
+                    df_disciplinas_ranking.to_excel(disciplinas_excel_path, index=False, engine='openpyxl')
+                    arquivos_exportados['disciplinas_ranking_excel'] = disciplinas_excel_path
+                    print(f"   ✅ Ranking salvo em: {disciplinas_excel_path}")
+                except Exception as e:
+                    print(f"   ⚠️  Erro ao exportar Excel de disciplinas: {str(e)}")
+
+                if self.disciplinas_extraidas is not None:
+                    disciplinas_detalhes_path = os.path.join(pasta_saida_completa, "disciplinas_detalhes.csv")
+                    self.disciplinas_extraidas.to_csv(disciplinas_detalhes_path, index=False, encoding='utf-8-sig')
+                    arquivos_exportados['disciplinas_detalhes'] = disciplinas_detalhes_path
+                    print(f"   ✅ Detalhes salvos em: {disciplinas_detalhes_path}")
+            else:
+                print("   ⚠️  Nenhuma disciplina para exportar")
+
+        print("\n7️⃣  Exportando resumo estatístico...")
+        resumo_path = os.path.join(pasta_saida_completa, "resumo_estatistico.txt")
+
+        buffer_estatisticas = StringIO()
+        with redirect_stdout(buffer_estatisticas):
+            if coluna_tipo in self.df.columns and not df_filtrado.empty:
+                self.df = df_filtrado
+                try:
+                    self.gerar_estatisticas(incluir_disciplinas=exportar_disciplinas)
+                finally:
+                    self.df = df_original
+            elif coluna_tipo not in self.df.columns:
+                print("Coluna 'TIPO_REQUERIMENTO' não encontrada.")
+            else:
+                print("Nenhum registro encontrado após filtro.")
+        texto_estatisticas = buffer_estatisticas.getvalue()
+
+        with open(resumo_path, 'w', encoding='utf-8') as f:
+            f.write("=" * 80 + "\n")
+            f.write("RESUMO ESTATÍSTICO - REQUERIMENTOS (COM ANÁLISE DE DISCIPLINAS)\n")
+            f.write("=" * 80 + "\n\n")
+            f.write(f"Data de Processamento: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}\n")
+            f.write(f"Total de Registros na base original: {len(df_original):,}\n")
+            f.write(f"Total de Colunas: {len(df_original.columns)}\n\n")
+
+            if coluna_tipo in self.df.columns:
+                f.write(f"Total de Registros no resumo (tipos selecionados): {len(df_filtrado):,}\n")
+                f.write(f"Tipos de requerimento filtrados: {len(tipos_interesse)} tipos\n\n")
+            else:
+                f.write("⚠️  Coluna 'TIPO_REQUERIMENTO' não encontrada.\n\n")
+
+            f.write("=" * 80 + "\n")
+            f.write("ESTATÍSTICAS DETALHADAS\n")
+            f.write("=" * 80 + "\n\n")
+            f.write(texto_estatisticas)
+            f.write("\n\n")
+
+            if coluna_tipo in self.df.columns and not df_filtrado.empty:
+                f.write("=" * 80 + "\n")
+                f.write("DESCRITIVO DO DATAFRAME FILTRADO\n")
+                f.write("=" * 80 + "\n\n")
+                f.write(df_filtrado.describe(include='all').to_string())
+
+        arquivos_exportados['resumo'] = resumo_path
+        print(f"   ✅ Salvo em: {resumo_path}")
+
+        print(f"\n✅ Exportação concluída! {len(arquivos_exportados)} arquivos criados.")
+        return arquivos_exportados
+
+    # =========================================================================
+    # MÉTODO 6: PREENCHER PLANILHAS EXISTENTES
+    # =========================================================================
+
+    def preencher_planilhas_existentes(self, pasta=None, usar_dados_filtrados=False):
+        print("\n" + "=" * 80)
+        print("📝 PREENCHENDO PLANILHAS EXISTENTES NA PASTA")
+        print("=" * 80)
+
+        if self.df is None:
+            print("❌ Nenhum dado carregado.")
+            return None
+
+        if usar_dados_filtrados:
+            tipos_interesse = [
+                "CURSAR MATÉRIA EM REGIME ESPECIAL - MESMO CAMPUS",
+                "RECLAMAÇÃO SOBRE MEU CURSO",
+                "RECLAMAÇÃO ATENDIMENTO DO COORD. DE CURSO",
+                "REVISÃO OU ACERTO DE NOTAS E FALTAS ONLINE",
+                "RECLAMAÇÃO DE PROCESSOS ACADÊMICOS",
+                "RECLAMAÇÃO DECLARAÇÕES ACADÊMICAS",
+                "CURSAR MATÉRIA EM REGIME ESPECIAL - OUTRO CAMPUS",
+                "DECLARAÇÃO DE CRITÉRIO DE APROVAÇÃO",
+                "MUDAR PARA OUTRO CURRÍCULO DO CURSO",
+                "REALIZAR SELEÇÃO PARA MONITORIA",
+                "RECLAMAÇÃO AGENDAMENTO/REAGENDAMENTO DE AVALIAÇÕES",
+                "RECLAMAÇÃO DE ESTÁGIO",
+                "REVISAR NOTA DE AV/AVS - MATÉRIA ONLINE",
+                "SOLICITAR ACERTO DE NOTA/PRES. MATÉRIA PRESENCIAL",
+                "SOLICITAR COLAÇÃO DE GRAU ANTECIPADA",
+            ]
+
+            coluna_tipo = "TIPO_REQUERIMENTO"
+            if coluna_tipo in self.df.columns:
+                df_tipos_normalizados = self.df[coluna_tipo].fillna('').astype(str).str.strip().str.upper()
+                tipos_interesse_normalizados = [tipo.strip().upper() for tipo in tipos_interesse]
+                mascara = (df_tipos_normalizados != '') & (df_tipos_normalizados != 'NAN') & df_tipos_normalizados.isin(tipos_interesse_normalizados)
+                df_para_preencher = self.df[mascara].copy()
+            else:
+                print("⚠️  Coluna 'TIPO_REQUERIMENTO' não encontrada. Usando todos os dados.")
+                df_para_preencher = self.df.copy()
+        else:
+            df_para_preencher = self.df.copy()
+
+        if pasta is None:
+            pasta_busca = self.diretorio_base
+        else:
+            pasta_busca = self._obter_caminho_saida(pasta)
+
+        if not os.path.exists(pasta_busca):
+            print(f"❌ Pasta não encontrada: {pasta_busca}")
+            return None
+
+        extensoes_excel = ['.xlsx', '.xls']
+        planilhas_encontradas = []
+
+        for arquivo in os.listdir(pasta_busca):
+            caminho_completo = os.path.join(pasta_busca, arquivo)
+
+            if os.path.isdir(caminho_completo):
+                continue
+
+            for ext in extensoes_excel:
+                if arquivo.lower().endswith(ext):
+                    if arquivo.startswith('requerimentos_') or arquivo.startswith('dados_') or arquivo.startswith('disciplinas_'):
+                        continue
+                    planilhas_encontradas.append(caminho_completo)
+                    break
+
+        if not planilhas_encontradas:
+            print(f"⚠️  Nenhuma planilha Excel encontrada na pasta: {pasta_busca}")
+            return None
+
+        planilhas_preenchidas = {}
+
+        print(f"\n📊 Encontradas {len(planilhas_encontradas)} planilha(s)")
+        print(f"📁 Pasta: {pasta_busca}")
+        print(f"📊 Dados para preencher: {len(df_para_preencher):,} registros\n")
+
+        for planilha_path in planilhas_encontradas:
+            try:
+                nome_arquivo = os.path.basename(planilha_path)
+                print(f"📝 Processando: {nome_arquivo}...")
+
+                nome_base = os.path.splitext(nome_arquivo)[0]
+                extensao = os.path.splitext(nome_arquivo)[1]
+                nome_saida = f"{nome_base}_preenchido{extensao}"
+                caminho_saida = os.path.join(pasta_busca, nome_saida)
+
+                df_para_preencher.to_excel(caminho_saida, index=False, engine='openpyxl')
+                planilhas_preenchidas[planilha_path] = caminho_saida
+
+                print(f"   ✅ Preenchida! ({len(df_para_preencher):,} registros)")
+                print(f"   💾 Salvo em: {nome_saida}\n")
+
+            except Exception as e:
+                print(f"   ❌ Erro: {str(e)}\n")
+
+        if planilhas_preenchidas:
+            print(f"✅ Total de {len(planilhas_preenchidas)} planilha(s) preenchida(s)!")
+
+        return planilhas_preenchidas
+
+    # =========================================================================
+    # MÉTODO 7: FILTROS PERSONALIZADOS
+    # =========================================================================
+
+    def filtrar_dados(self, filtros):
+        print("\n" + "=" * 80)
+        print("🔍 APLICANDO FILTROS")
+        print("=" * 80)
+
+        if self.df is None:
+            print("❌ Nenhum dado carregado.")
+            return None
+
+        df_filtrado = self.df.copy()
+
+        for coluna, valor in filtros.items():
+            if coluna in df_filtrado.columns:
+                registros_antes = len(df_filtrado)
+                df_filtrado = df_filtrado[df_filtrado[coluna] == valor]
+                registros_depois = len(df_filtrado)
+                print(f"  📌 {coluna} = '{valor}': {registros_antes:,} → {registros_depois:,}")
+            else:
+                print(f"  ⚠️  Coluna '{coluna}' não encontrada.")
+
+        print(f"\n✅ Total após filtros: {len(df_filtrado):,}")
+        return df_filtrado
+
+    # =========================================================================
+    # MÉTODO 8: RELATÓRIO COMPLETO
+    # =========================================================================
+
+    def gerar_relatorio_completo(self, pasta_saida='relatorio_final'):
+        print("\n" + "=" * 80)
+        print("📊 GERANDO RELATÓRIO COMPLETO")
+        print("=" * 80)
+
+        pasta_saida_completa = self._obter_caminho_saida(pasta_saida)
+        os.makedirs(pasta_saida_completa, exist_ok=True)
+
+        self.exportar_dados(pasta_saida, exportar_disciplinas=True)
+        _ = self.gerar_estatisticas(incluir_disciplinas=True)
+
+        print("\n📂 Separando por STATUS...")
+        self.separar_por_categoria('STATUS_REQUERIMENTO', os.path.join(pasta_saida, 'por_status'))
+
+        print("\n📂 Separando por TIPO DE REQUERIMENTO...")
+        self.separar_por_categoria('TIPO_REQUERIMENTO', os.path.join(pasta_saida, 'por_tipo'))
+
+        print("\n" + "=" * 80)
+        print("✅ RELATÓRIO COMPLETO GERADO!")
+        print(f"📁 Arquivos em: {pasta_saida_completa}")
+        print("=" * 80)
+
+
+# =============================================================================
+# 🧩 NOVA FUNCIONALIDADE: DISTRIBUIÇÃO AUTOMÁTICA PARA COLABORADORES
+# =============================================================================
+
+from collections import defaultdict
+from typing import Dict, Any, List, Optional
+
+try:
+    from openpyxl import load_workbook
+    from openpyxl.utils import get_column_letter
+    from openpyxl.worksheet.datavalidation import DataValidation
+    from openpyxl.worksheet.table import Table, TableStyleInfo
+except ImportError:
+    load_workbook = None
+    get_column_letter = None
+    DataValidation = None
+    Table = None
+    TableStyleInfo = None
+
+
+def _sanitizar_nome_arquivo(nome: str) -> str:
+    """Remove caracteres inválidos para nome de arquivo."""
+    nome = str(nome).strip()
+    nome = re.sub(r"[^\w\s-]", "", nome, flags=re.UNICODE)
+    nome = re.sub(r"[-\s]+", "_", nome)
+    return nome[:80] if nome else "colaborador"
+
+
+def _carregar_workbook_modelo(modelo_planilha: str):
+    """Carrega workbook do template Excel preservando formatação, validações e macros (VBA)."""
+    if load_workbook is None:
+        raise ImportError("openpyxl não está instalado. Instale com: pip install openpyxl")
+    if not os.path.exists(modelo_planilha):
+        raise FileNotFoundError(f"Planilha modelo não encontrada: {modelo_planilha}")
+    # data_only=False preserva fórmulas, formatação e validações; keep_vba=True preserva macros (.xlsm)
+    return load_workbook(modelo_planilha, data_only=False, keep_vba=True)
+
+
+def _selecionar_aba_modelo(wb, aba_modelo: Optional[str]):
+    """Seleciona aba do template (primeira se None)."""
+    if aba_modelo:
+        if aba_modelo not in wb.sheetnames:
+            raise ValueError(f"Aba '{aba_modelo}' não existe no modelo. Abas: {wb.sheetnames}")
+        return wb[aba_modelo]
+    return wb[wb.sheetnames[0]]
+
+
+def _mapear_colunas_modelo(ws_modelo, linha_cabecalho: int) -> Dict[str, int]:
+    """Mapeia NOME_COLUNA -> índice (1-based) conforme cabeçalho do template."""
+    mapping = {}
+    for cell in ws_modelo[linha_cabecalho]:
+        if cell.value is None:
+            continue
+        nome = str(cell.value).strip()
+        if nome:
+            mapping[nome] = cell.col_idx
+    return mapping
+
+
+def _estender_validacoes_ate_linha(ws, ultima_linha_dados: int):
+    """
+    Estende as validações de dados (listas suspensas) do modelo até ultima_linha_dados,
+    para que as novas linhas preenchidas também tenham a formatação de lista suspensa.
+    """
+    if ultima_linha_dados < 1:
+        return
+    try:
+        dvl = getattr(ws, "data_validations", None)
+        if dvl is None or not hasattr(dvl, "dataValidation"):
+            return
+        for dv in list(dvl.dataValidation or []):
+            try:
+                sqref = getattr(dv, "sqref", None)
+                if sqref is None:
+                    continue
+                # sqref pode ser string "A2:D50" ou objeto com __str__
+                range_str = str(sqref).strip()
+                if not range_str:
+                    continue
+                # Pode ter vários intervalos separados por espaço: "A2:A50 B2:B50"
+                novos_ranges = []
+                for parte in range_str.split():
+                    # Cada parte: "A2:A50" ou "D2:D50"
+                    m = re.match(r"^([A-Z]+)(\d+):([A-Z]+)(\d+)$", parte, re.I)
+                    if m:
+                        col_ini, row_ini, col_fim, row_fim = m.groups()
+                        row_fim_num = int(row_fim)
+                        novo_fim = max(row_fim_num, ultima_linha_dados)
+                        novos_ranges.append(f"{col_ini}{row_ini}:{col_fim}{novo_fim}")
+                    else:
+                        novos_ranges.append(parte)
+                if novos_ranges:
+                    dv.sqref = " ".join(novos_ranges)
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+
+def _estender_formatacao_condicional_ate_linha(ws, ultima_linha_dados: int, linha_cabecalho: int):
+    """
+    Estende os intervalos (sqref) da formatação condicional do modelo até ultima_linha_dados,
+    para que as novas linhas preenchidas também tenham a formatação condicional (cores, ícones, etc.).
+    """
+    if ultima_linha_dados < linha_cabecalho:
+        return
+    try:
+        cf_list = getattr(ws, "conditional_formatting", None)
+        if cf_list is None:
+            return
+        for cf in list(cf_list):
+            try:
+                sqref = getattr(cf, "sqref", None)
+                if sqref is None:
+                    continue
+                range_str = str(sqref).strip()
+                if not range_str:
+                    continue
+                # Pode ter vários intervalos separados por espaço: "A2:K50 B2:B50"
+                novos_ranges = []
+                for parte in range_str.split():
+                    m = re.match(r"^([A-Z]+)(\d+):([A-Z]+)(\d+)$", parte, re.I)
+                    if m:
+                        col_ini, row_ini, col_fim, row_fim = m.groups()
+                        row_fim_num = int(row_fim)
+                        # Só estender se a regra atingir a área de dados (linha >= cabeçalho)
+                        if row_fim_num >= linha_cabecalho:
+                            novo_fim = max(row_fim_num, ultima_linha_dados)
+                            novos_ranges.append(f"{col_ini}{row_ini}:{col_fim}{novo_fim}")
+                        else:
+                            novos_ranges.append(parte)
+                    else:
+                        novos_ranges.append(parte)
+                if novos_ranges:
+                    cf.sqref = " ".join(novos_ranges)
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+
+def _estender_tabelas_ate_linha(ws, ultima_linha_dados: int, linha_cabecalho: int):
+    """
+    Estende o intervalo (ref) das Tabelas do Excel na planilha até ultima_linha_dados,
+    para que as novas linhas preenchidas façam parte da tabela (filtros, formatação).
+    """
+    if ultima_linha_dados < linha_cabecalho:
+        return
+    try:
+        tabelas = getattr(ws, "tables", None)
+        if tabelas is None:
+            return
+        for _nome, tb in list(tabelas.items() if hasattr(tabelas, "items") else []):
+            try:
+                ref = getattr(tb, "ref", None)
+                if not ref:
+                    continue
+                # ref no formato "A1:K50" -> estender última linha até ultima_linha_dados
+                m = re.match(r"^([A-Z]+)(\d+):([A-Z]+)(\d+)$", str(ref).strip(), re.I)
+                if m:
+                    col_ini, row_ini, col_fim, row_fim = m.groups()
+                    row_fim_num = int(row_fim)
+                    novo_fim = max(row_fim_num, ultima_linha_dados)
+                    tb.ref = f"{col_ini}{row_ini}:{col_fim}{novo_fim}"
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+
+def _garantir_tabela_na_planilha(ws, linha_cabecalho: int, ultima_linha_dados: int,
+                                colmap: Dict[str, int]):
+    """
+    Se a planilha não tiver nenhuma Tabela do Excel, cria uma sobre a área de dados
+    (cabeçalho + linhas preenchidas), com estilo listrado e filtro automático.
+    """
+    if Table is None or TableStyleInfo is None or get_column_letter is None:
+        return
+    if ultima_linha_dados < linha_cabecalho or not colmap:
+        return
+    try:
+        tabelas = getattr(ws, "tables", None)
+        if tabelas is None:
+            return
+        # Se já existe pelo menos uma tabela, não criar outra
+        if len(tabelas) > 0:
+            return
+        num_cols = max(colmap.values())
+        ref = f"A{linha_cabecalho}:{get_column_letter(num_cols)}{ultima_linha_dados}"
+        tab = Table(displayName="TabelaDados", ref=ref)
+        style = TableStyleInfo(
+            name="TableStyleMedium9",
+            showFirstColumn=False,
+            showLastColumn=False,
+            showRowStripes=True,
+            showColumnStripes=False,
+        )
+        tab.tableStyleInfo = style
+        ws.add_table(tab)
+    except Exception:
+        pass
+
+
+def _limpar_area_dados(ws, primeira_linha_dados: int):
+    """Limpa valores da área de dados (mantém estilos/formato e validações)."""
+    max_row = ws.max_row
+    max_col = ws.max_column
+    if max_row < primeira_linha_dados:
+        return
+    for r in range(primeira_linha_dados, max_row + 1):
+        for c in range(1, max_col + 1):
+            ws.cell(row=r, column=c, value=None)
+
+
+def _preencher_dados_na_planilha(ws_destino,
+                                df: pd.DataFrame,
+                                colmap_modelo: Dict[str, int],
+                                primeira_linha_dados: int,
+                                colaborador: Optional[str],
+                                coluna_responsavel_modelo: str):
+    """
+    Preenche template com base nas colunas do modelo.
+    Só escreve colunas existentes no modelo.
+    Sobrescreve COLABORADORES com o nome do colaborador.
+    """
+    if df.empty:
+        return
+
+    colunas_modelo = list(colmap_modelo.keys())
+    idx_col_responsavel = colmap_modelo.get(coluna_responsavel_modelo)
+
+    linha = primeira_linha_dados
+    for _, registro in df.iterrows():
+        # Preenche todas as colunas do modelo que existirem no DF
+        for col_name in colunas_modelo:
+            if col_name == coluna_responsavel_modelo:
+                continue
+
+            if col_name in df.columns:
+                valor = registro[col_name]
+                if pd.isna(valor):
+                    valor = None
+                ws_destino.cell(row=linha, column=colmap_modelo[col_name], value=valor)
+
+        # Força responsável no template
+        if colaborador and idx_col_responsavel:
+            ws_destino.cell(row=linha, column=idx_col_responsavel, value=colaborador)
+
+        linha += 1
+
+
+def distribuir_para_colaboradores(df: pd.DataFrame,
+                                  modelo_planilha: str,
+                                  config_colaboradores: Dict[str, Dict[str, Any]],
+                                  pasta_saida: str,
+                                  modo: str = "equilibrado",
+                                  coluna_distribuicao: str = "TIPO_REQUERIMENTO",
+                                  aba_modelo: Optional[str] = None,
+                                  linha_cabecalho_modelo: int = 1,
+                                  primeira_linha_dados: int = 2,
+                                  coluna_responsavel_modelo: str = "COLABORADORES",
+                                  limite_padrao: Optional[int] = None,
+                                  regra_sem_responsavel: str = "relatorio",
+                                  gerar_relatorio_resumo: bool = True) -> Dict[str, Any]:
+    """
+    🧑‍🤝‍🧑 DISTRIBUIÇÃO ESTRITA POR TIPO_REQUERIMENTO
+    
+    Regras:
+    - Cada colaborador só recebe os tipos listados em 'recebe'
+    - Ninguém pega "o resto" (sem generalista)
+    - 1 protocolo -> 1 colaborador (sem duplicação)
+    - Se um tipo não tiver responsável elegível:
+        * regra_sem_responsavel="erro" => interrompe
+        * regra_sem_responsavel="relatorio" => exporta nao_atribuidos.csv
+    
+    Gera 1 XLSX por colaborador idêntico ao template.
+    """
+
+    print("\n" + "=" * 80)
+    print("🧑‍🤝‍🧑 DISTRIBUIÇÃO (ESTRITA POR TIPO_REQUERIMENTO CONFIGURADO)")
+    print("=" * 80)
+
+    if df is None or df.empty:
+        raise ValueError("DataFrame vazio: não há requerimentos para distribuir.")
+
+    if coluna_distribuicao not in df.columns:
+        raise KeyError(f"Coluna de distribuição não encontrada: '{coluna_distribuicao}'")
+
+    if not isinstance(config_colaboradores, dict) or not config_colaboradores:
+        raise ValueError("Config COLABORADORES vazia ou inválida.")
+
+    os.makedirs(pasta_saida, exist_ok=True)
+
+    # Normaliza config e identifica ativos
+    ativos = []
+    cfg_norm = {}
+    for nome, cfg in config_colaboradores.items():
+        cfg = cfg or {}
+        ativo = bool(cfg.get("ativo", True))
+        recebe = cfg.get("recebe", [])
+        if recebe is None:
+            recebe = []
+        recebe = [str(x).strip() for x in recebe if str(x).strip()]
+        limite = cfg.get("limite", limite_padrao)
+
+        cfg_norm[nome] = {"ativo": ativo, "recebe": recebe, "limite": limite}
+        if ativo:
+            ativos.append(nome)
+
+    if not ativos:
+        raise ValueError("Nenhum colaborador ativo. Ative ao menos 1 no painel.")
+
+    # Aviso para ativos sem lista
+    for nome in ativos:
+        if not cfg_norm[nome]["recebe"]:
+            print(f"⚠️ '{nome}' está ativo mas com 'recebe' vazio: ele NÃO receberá nada.")
+
+    # Mapeamento: tipo -> colaboradores elegíveis
+    tipo_para_elegiveis = defaultdict(list)
+    for nome in ativos:
+        for t in cfg_norm[nome]["recebe"]:
+            tipo_para_elegiveis[t].append(nome)
+
+    # Normaliza o tipo do DF
+    serie_tipo = df[coluna_distribuicao].fillna("").astype(str).str.strip()
+
+    print(f"\n📌 Coluna usada para distribuir: {coluna_distribuicao}")
+    print(f"⚙️  Modo (empate entre elegíveis): {modo}")
+    print(f"👥 Ativos: {len(ativos)} -> {', '.join(ativos)}")
+    print(f"📄 Template: {modelo_planilha}")
+    print(f"📁 Saída: {os.path.abspath(pasta_saida)}")
+
+    # Estado da distribuição
+    carga_atual = {c: 0 for c in ativos}
+    limites = {c: cfg_norm[c]["limite"] for c in ativos}
+    atribuicoes = {c: [] for c in ativos}
+    nao_atribuidos = []
+    avisos = []
+
+    # Distribuição 1:1 (sem duplicar)
+    for idx, tipo in zip(df.index, serie_tipo):
+        elegiveis = tipo_para_elegiveis.get(tipo, [])
+
+        if not elegiveis:
+            nao_atribuidos.append(idx)
+            continue
+
+        # Escolha do colaborador entre elegíveis
+        if modo == "prioridade":
+            escolhido = elegiveis[0]
+        elif modo == "equilibrado":
+            # Menor carga, tentando respeitar limite
+            elegiveis_ordenados = sorted(elegiveis, key=lambda c: carga_atual[c])
+            escolhido = None
+            for c in elegiveis_ordenados:
+                lim = limites.get(c)
+                if lim is None or carga_atual[c] < lim:
+                    escolhido = c
+                    break
+            if escolhido is None:
+                # Todos no limite: atribui ao menos carregado e alerta
+                escolhido = elegiveis_ordenados[0]
+                avisos.append(
+                    f"⚠️ Sobrecarga: tipo '{tipo}' excedeu limites dos elegíveis; "
+                    f"atribuído a '{escolhido}'."
+                )
+        else:
+            raise ValueError("modo inválido. Use 'equilibrado' ou 'prioridade'.")
+
+        atribuicoes[escolhido].append(idx)
+        carga_atual[escolhido] += 1
+
+    # Política para não atribuídos
+    if nao_atribuidos:
+        msg = (
+            f"❗ Existem {len(nao_atribuidos)} requerimentos sem responsável elegível "
+            f"(coluna={coluna_distribuicao})."
+        )
+        if regra_sem_responsavel == "erro":
+            raise RuntimeError(
+                msg + " Ajuste o painel (COLABORADORES[*]['recebe']) e rode novamente."
+            )
+        else:
+            avisos.append(
+                msg + " Exportando 'nao_atribuidos.csv' e NÃO atribuindo esses itens."
+            )
+
+    # Valida não duplicação
+    todos = []
+    for c in ativos:
+        todos.extend(atribuicoes[c])
+    if len(set(todos)) != len(todos):
+        raise RuntimeError(
+            "Erro crítico: houve duplicação na atribuição "
+            "(um registro foi para 2 colaboradores)."
+        )
+
+    # Carrega template
+    wb_modelo = _carregar_workbook_modelo(modelo_planilha)
+    ws_modelo = _selecionar_aba_modelo(wb_modelo, aba_modelo)
+    colmap = _mapear_colunas_modelo(ws_modelo, linha_cabecalho_modelo)
+
+    # Validação amigável do cabeçalho do template
+    colunas_esperadas = [
+        "PROTOCOLO", "TIPO_REQUERIMENTO", "COLABORADORES", "DT_INICIO_ETAPA",
+        "DT_PRAZO_FINAL", "FAIXA_DIAS_TOTAL", "NOM_CAMPUS", "NOM_CURSO",
+        "SUTUAÇÃO", "TIPO_REQ", "REAL_MOTIVO"
+    ]
+    faltando_no_modelo = [c for c in colunas_esperadas if c not in colmap]
+    if faltando_no_modelo:
+        avisos.append(
+            "⚠️ Template: colunas esperadas não encontradas no cabeçalho: "
+            + ", ".join(faltando_no_modelo)
+        )
+
+    arquivos_gerados = {}
+    resumo_rows = []
+
+    # Exporta não atribuídos se estiver em modo "relatorio"
+    if nao_atribuidos and regra_sem_responsavel != "erro":
+        df_nao = df.loc[nao_atribuidos].copy()
+        caminho_nao = os.path.join(pasta_saida, "nao_atribuidos.csv")
+        df_nao.to_csv(caminho_nao, index=False, encoding="utf-8-sig")
+        print(f"\n📄 Não atribuídos salvo em: {caminho_nao}")
+        print(f"   ℹ️  Esses {len(nao_atribuidos)} requerimentos não estão em nenhum 'recebe' de colaborador ativo.")
+
+    print("\n📤 GERANDO PLANILHAS POR COLABORADOR")
+    print("-" * 60)
+
+    for colaborador in ativos:
+        idxs = atribuicoes[colaborador]
+        df_colab = df.loc[idxs].copy()
+
+        # Sobrescreve responsável no recorte
+        if coluna_responsavel_modelo in df_colab.columns:
+            df_colab[coluna_responsavel_modelo] = colaborador
+
+        nome_arquivo = f"gestao_requerimentos_{_sanitizar_nome_arquivo(colaborador)}.xlsm"
+        caminho_saida = os.path.join(pasta_saida, nome_arquivo)
+
+        # Carrega template "fresco" para manter estrutura/estilos
+        wb_out = _carregar_workbook_modelo(modelo_planilha)
+        ws_out = _selecionar_aba_modelo(wb_out, aba_modelo)
+
+        _limpar_area_dados(ws_out, primeira_linha_dados)
+
+        _preencher_dados_na_planilha(
+            ws_out,
+            df_colab,
+            colmap,
+            primeira_linha_dados,
+            colaborador=colaborador,
+            coluna_responsavel_modelo=coluna_responsavel_modelo
+        )
+
+        # Estender listas suspensas (validações) do modelo até as novas linhas preenchidas
+        ultima_linha = primeira_linha_dados + len(df_colab) - 1
+        if ultima_linha >= primeira_linha_dados:
+            _estender_validacoes_ate_linha(ws_out, ultima_linha)
+            # Estender formatação condicional do modelo até as novas linhas
+            _estender_formatacao_condicional_ate_linha(ws_out, ultima_linha, linha_cabecalho_modelo)
+            # Estender Tabelas do Excel existentes no modelo até as novas linhas
+            _estender_tabelas_ate_linha(ws_out, ultima_linha, linha_cabecalho_modelo)
+            # Se o modelo não tiver tabela, criar uma (formatação listrada + filtro)
+            _garantir_tabela_na_planilha(ws_out, linha_cabecalho_modelo, ultima_linha, colmap)
+
+        wb_out.save(caminho_saida)
+        arquivos_gerados[colaborador] = caminho_saida
+
+        limite = limites.get(colaborador)
+        sobrecarga = (limite is not None and len(df_colab) > limite)
+
+        print(f"✅ {colaborador}: {len(df_colab):,} -> {nome_arquivo}")
+        recebe_str = cfg_norm[colaborador]['recebe']
+        print(f"   🎯 Recebe: {recebe_str if recebe_str else '(nenhum)'}")
+        if sobrecarga:
+            aviso = (
+                f"⚠️ ALERTA SOBRECARGA: '{colaborador}' recebeu {len(df_colab)} "
+                f"acima do limite {limite}"
+            )
+            avisos.append(aviso)
+            print(f"   {aviso}")
+
+        resumo_rows.append({
+            "COLABORADOR": colaborador,
+            "QTD": int(len(df_colab)),
+            "LIMITE": limite,
+            "SOBRECARGA": bool(sobrecarga),
+            "RECEBE_CONFIG": "; ".join(cfg_norm[colaborador]["recebe"]),
+            "ARQUIVO": caminho_saida
+        })
+
+    df_resumo = pd.DataFrame(resumo_rows).sort_values("QTD", ascending=False)
+
+    if gerar_relatorio_resumo:
+        resumo_csv = os.path.join(pasta_saida, "resumo_distribuicao_colaboradores.csv")
+        df_resumo.to_csv(resumo_csv, index=False, encoding="utf-8-sig")
+        print(f"\n📄 Resumo salvo em: {resumo_csv}")
+
+    if avisos:
+        print("\n⚠️ AVISOS")
+        print("-" * 60)
+        for a in avisos:
+            print(a)
+
+    return {
+        "arquivos_gerados": arquivos_gerados,
+        "resumo": df_resumo,
+        "nao_atribuidos_indices": nao_atribuidos,
+        "atribuicoes_indices": atribuicoes,
+        "avisos": avisos
+    }
+
+
+# =============================================================================
+# FUNÇÃO AUXILIAR - BUSCAR PLANILHA
+# =============================================================================
+
+def buscar_planilha_na_pasta():
+    """Busca planilha de DADOS na pasta (exclui Gestao_Requerimentos, que é só modelo)."""
+    diretorio_script = os.path.dirname(os.path.abspath(__file__))
+    extensoes = ['.csv', '.xlsx', '.xls']
+    nome_modelo = os.path.basename(PLANILHA_MODELO)  # Gestao_Requerimentos.xlsm – não usar como fonte de dados
+
+    arquivos_encontrados = []
+    for arquivo in os.listdir(diretorio_script):
+        caminho_completo = os.path.join(diretorio_script, arquivo)
+
+        if os.path.isdir(caminho_completo):
+            continue
+
+        if arquivo.endswith('.py') or arquivo.startswith('dados_') or arquivo.startswith('relatorio_'):
+            continue
+
+        # Ignorar a planilha modelo (usada só como base na distribuição)
+        if arquivo == nome_modelo or os.path.normpath(caminho_completo) == os.path.normpath(PLANILHA_MODELO):
+            continue
+
+        for ext in extensoes:
+            if arquivo.lower().endswith(ext):
+                arquivos_encontrados.append(caminho_completo)
+                break
+
+    if arquivos_encontrados:
+        if len(arquivos_encontrados) == 1:
+            print(f"📁 Arquivo encontrado: {os.path.basename(arquivos_encontrados[0])}")
+            return arquivos_encontrados[0]
+        else:
+            arquivos_ordenados = sorted(arquivos_encontrados, key=lambda x: (
+                0 if x.endswith('.csv') else (1 if x.endswith('.xlsx') else 2)
+            ))
+            arquivo_selecionado = arquivos_ordenados[0]
+            print(f"📁 Usando: {os.path.basename(arquivo_selecionado)}")
+            return arquivo_selecionado
+    else:
+        print("❌ Nenhum arquivo encontrado.")
+        return None
+
+
+# =============================================================================
+# FUNÇÃO PRINCIPAL
+# =============================================================================
+
+def main():
+    # Buscar planilha de DADOS na pasta (exclui Gestao_Requerimentos, que é só modelo para distribuição)
+    caminho_arquivo = buscar_planilha_na_pasta()
+
+    if caminho_arquivo is None:
+        print("❌ Não foi possível encontrar planilha. Encerrando.")
+        return
+
+    tratador = TratadorRequerimentos(caminho_arquivo)
+
+    if not tratador.carregar_dados():
+        print("❌ Falha ao carregar. Encerrando.")
+        return
+
+    if not tratador.limpar_dados():
+        print("❌ Falha ao limpar. Encerrando.")
+        return
+
+    print("\n" + "=" * 80)
+    print("📚 EXTRAINDO DISCIPLINAS")
+    print("=" * 80)
+    _ = tratador.extrair_disciplinas()
+
+    _ = tratador.gerar_estatisticas(incluir_disciplinas=True)
+    _ = tratador.exportar_dados(exportar_disciplinas=True)
+
+    print("\n" + "=" * 80)
+    print("📝 PREENCHENDO PLANILHAS EXISTENTES")
+    print("=" * 80)
+    tratador.preencher_planilhas_existentes(usar_dados_filtrados=False)
+
+    print("\n" + "=" * 80)
+    print("🔍 EXEMPLO: FILTRANDO ABERTOS")
+    print("=" * 80)
+    df_abertos = tratador.filtrar_dados({'STATUS_REQUERIMENTO': 'ABERTO'})
+    if df_abertos is not None:
+        caminho_abertos = os.path.join(tratador.diretorio_base, 'dados_processados', 'requerimentos_abertos.csv')
+        os.makedirs(os.path.dirname(caminho_abertos), exist_ok=True)
+        df_abertos.to_csv(caminho_abertos, index=False, encoding='utf-8-sig')
+        print(f"✅ Salvos em: {caminho_abertos}")
+
+    # -------------------------------------------------------------------------
+    # 🧑‍🤝‍🧑 NOVA ETAPA: DISTRIBUIÇÃO ESTRITA POR TIPO_REQUERIMENTO
+    # -------------------------------------------------------------------------
+    try:
+        resultado_dist = distribuir_para_colaboradores(
+            df=tratador.df,
+            modelo_planilha=PLANILHA_MODELO,
+            config_colaboradores=COLABORADORES,
+            pasta_saida=tratador._obter_caminho_saida(PASTA_SAIDA_COLABORADORES),
+            modo=MODO_DISTRIBUICAO,
+            coluna_distribuicao=COLUNA_DISTRIBUICAO,
+            aba_modelo=ABA_MODELO,
+            linha_cabecalho_modelo=LINHA_CABECALHO_MODELO,
+            primeira_linha_dados=PRIMEIRA_LINHA_DADOS,
+            coluna_responsavel_modelo=COLUNA_RESPONSAVEL_MODELO,
+            limite_padrao=LIMITE_PADRAO_POR_COLABORADOR,
+            regra_sem_responsavel=REGRA_SEM_RESPONSAVEL,
+            gerar_relatorio_resumo=GERAR_RELATORIO_RESUMO
+        )
+
+        print("\n📊 RESUMO (POR COLABORADOR)")
+        print("-" * 80)
+        print(
+            resultado_dist["resumo"][["COLABORADOR", "QTD", "SOBRECARGA", "ARQUIVO"]]
+            .to_string(index=False)
+        )
+
+    except Exception as e:
+        print("\n❌ Erro na distribuição para colaboradores:")
+        print(f"   {str(e)}")
+        import traceback
+        traceback.print_exc()
+
+    print("\n" + "=" * 80)
+    print("🎉 PROCESSAMENTO CONCLUÍDO COM SUCESSO!")
+    print("=" * 80)
+    print("\n📁 ARQUIVOS GERADOS:")
+    print("   - requerimentos_completo.csv/xlsx (todos os dados)")
+    print("   - requerimentos_limpo.csv/xlsx (dados filtrados)")
+    print("   - disciplinas_ranking.csv/xlsx (TOP disciplinas compacto)")
+    print("   - disciplinas_detalhes.csv (nome + código separados)")
+    print("   - resumo_estatistico.txt (relatório completo)")
+    print("   - 🆕 gestao_requerimentos_[COLABORADOR].xlsm (1 por colaborador, com macro do modelo)")
+    print("   - 🆕 resumo_distribuicao_colaboradores.csv")
+    print("   - 🆕 nao_atribuidos.csv (requerimentos sem responsável)")
+
+
+if __name__ == "__main__":
+    main()
