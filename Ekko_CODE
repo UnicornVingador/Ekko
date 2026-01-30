@@ -1,6 +1,6 @@
 """
 =================================================================================
-SCRIPT DE TRATAMENTO DE DADOS - REQUERIMENTOS DIGITAIS
+EKKO - SCRIPT DE TRATAMENTO DE DADOS
 =================================================================================
 Autor: Jonathan Barbosa
 Objetivo: Limpar, processar e analisar dados de requerimentos digitais
@@ -1530,3 +1530,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
